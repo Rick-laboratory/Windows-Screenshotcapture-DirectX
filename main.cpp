@@ -1,125 +1,129 @@
-#include <Wincodec.h>             // we use WIC for saving images
-#include <d3d9.h>                 // DirectX 9 header
-#pragma comment(lib, "d3d9.lib")  // link to DirectX 9 library
+#include "windows_helpers.hpp"
+#include "png_writer.hpp"
 
-#define WIDEN2(x) L ## x
-#define WIDEN(x) WIDEN2(x)
-#define __WFILE__ WIDEN(__FILE__)
-#define RELEASE(__p) {if(__p!=nullptr){__p->Release();__p=nullptr;}}
+#include <d3d9.h>
+#include <chrono>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <string_view>
 
-HRESULT SavePixelsToFile32bppPBGRA(UINT width, UINT height, UINT stride, LPBYTE pixels, LPWSTR filePath, const GUID& format)
-{
-    if (!filePath || !pixels)
-        return E_INVALIDARG;
-
-    HRESULT hr = S_OK;
-    IWICImagingFactory* factory = nullptr;
-    IWICBitmapEncoder* encoder = nullptr;
-    IWICBitmapFrameEncode* frame = nullptr;
-    IWICStream* stream = nullptr;
-    GUID pf = GUID_WICPixelFormat32bppPBGRA;
-    BOOL coInit = CoInitialize(nullptr);
-
-    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-    factory->CreateStream(&stream);
-    stream->InitializeFromFilename(filePath, GENERIC_WRITE);
-    factory->CreateEncoder(format, nullptr, &encoder);
-    encoder->Initialize(stream, WICBitmapEncoderNoCache);
-    encoder->CreateNewFrame(&frame, nullptr); // we don't use options here
-    frame->Initialize(nullptr); // we dont' use any options here
-    frame->SetSize(width, height);
-    frame->SetPixelFormat(&pf);
-    frame->WritePixels(height, stride, stride * height, pixels);
-    frame->Commit();
-    encoder->Commit();
-
-    cleanup:
-    RELEASE(stream);
-    RELEASE(frame);
-    RELEASE(encoder);
-    RELEASE(factory);
-    if (coInit) CoUninitialize();
-    return hr;
-}
-HRESULT Direct3D9TakeScreenshots(UINT adapter, UINT count)
-{
-    HRESULT hr = S_OK;
-    IDirect3D9* d3d = nullptr;
-    IDirect3DDevice9* device = nullptr;
-    IDirect3DSurface9* surface = nullptr;
-    D3DPRESENT_PARAMETERS parameters = { 0 };
-    D3DDISPLAYMODE mode;
-    D3DLOCKED_RECT rc;
-    UINT pitch;
-    SYSTEMTIME st;
-    LPBYTE* shots = nullptr;
-
-    // init D3D and get screen size
-    d3d = Direct3DCreate9(D3D_SDK_VERSION);
-    d3d->GetAdapterDisplayMode(adapter, &mode);
-
-    parameters.Windowed = TRUE;
-    parameters.BackBufferCount = 1;
-    parameters.BackBufferHeight = mode.Height;
-    parameters.BackBufferWidth = mode.Width;
-    parameters.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    parameters.hDeviceWindow = NULL;
-
-    // create device & capture surface
-    d3d->CreateDevice(adapter, D3DDEVTYPE_HAL, NULL, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &parameters, &device);
-    device->CreateOffscreenPlainSurface(mode.Width, mode.Height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &surface, nullptr);
-
-    // compute the required buffer size
-    surface->LockRect(&rc, NULL, 0);
-    pitch = rc.Pitch;
-    surface->UnlockRect();
-
-    // allocate screenshots buffers
-    shots = new LPBYTE[count];
-    for (UINT i = 0; i < count; i++)
-    {
-        shots[i] = new BYTE[pitch * mode.Height];
+namespace {
+struct HiddenWindow {
+    HWND handle = CreateWindowExW(0, L"STATIC", L"Direct3D capture", WS_POPUP,
+                                   0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HiddenWindow() {
+        if (handle == nullptr) throw std::runtime_error("Cannot create the device's hidden window.");
     }
+    ~HiddenWindow() { DestroyWindow(handle); }
+    HiddenWindow(const HiddenWindow&) = delete;
+    HiddenWindow& operator=(const HiddenWindow&) = delete;
+};
 
-    GetSystemTime(&st); // measure the time we spend doing <count> captures
-   
-    for (UINT i = 0; i < count; i++)
-    {
-        // get the data
-        device->GetFrontBufferData(0, surface);
-
-        // copy it into our buffers
-        surface->LockRect(&rc, NULL, 0);
-        CopyMemory(shots[i], rc.pBits, rc.Pitch * mode.Height);
-        surface->UnlockRect();
+class SurfaceLock {
+public:
+    explicit SurfaceLock(IDirect3DSurface9* surface) : surface_(surface) {
+        check_hresult(surface_->LockRect(&rectangle, nullptr, D3DLOCK_READONLY), "Lock surface");
     }
-    GetSystemTime(&st);
-    
+    ~SurfaceLock() { surface_->UnlockRect(); }
+    SurfaceLock(const SurfaceLock&) = delete;
+    SurfaceLock& operator=(const SurfaceLock&) = delete;
+    D3DLOCKED_RECT rectangle{};
 
-    // save all screenshots
-    for (UINT i = 0; i < count; i++)
-    {
-        WCHAR file[100];
-        wsprintf(file, L"cap%i.png", i);
-        SavePixelsToFile32bppPBGRA(mode.Width, mode.Height, pitch, shots[i], file, GUID_ContainerFormatPng);
-    }
+private:
+    IDirect3DSurface9* surface_;
+};
 
-cleanup:
-    if (shots != nullptr)
-    {
-        for (UINT i = 0; i < count; i++)
-        {
-            delete shots[i];
+unsigned parse_count(std::wstring_view text) {
+    if (text.empty()) throw std::invalid_argument("Count must be an integer from 1 to 100.");
+    unsigned value = 0;
+    for (const wchar_t character : text) {
+        if (character < L'0' || character > L'9') {
+            throw std::invalid_argument("Count must be an integer from 1 to 100.");
         }
-        delete[] shots;
+        value = value * 10 + static_cast<unsigned>(character - L'0');
+        if (value > 100) throw std::invalid_argument("Count must be an integer from 1 to 100.");
     }
-    RELEASE(surface);
-    RELEASE(device);
-    RELEASE(d3d);
-    return hr;
+    if (value == 0) throw std::invalid_argument("Count must be an integer from 1 to 100.");
+    return value;
 }
-int main()
-{
-    HRESULT hr = Direct3D9TakeScreenshots(D3DADAPTER_DEFAULT, 10);
-    return 0;
+} // namespace
+
+int wmain(int argc, wchar_t* argv[]) {
+    const std::wstring_view option = argc >= 2 ? argv[1] : L"";
+    if (argc == 2 && (option == L"--help" || option == L"-h")) {
+        std::cout << "Usage: directx-capture [count] [existing-output-directory]\n"
+                     "Default: one PNG in the current directory. Count: 1..100.\n"
+                     "Files cap0.png, cap1.png, ... are overwritten if present.\n"
+                     "--check initializes the device and surface without capturing pixels.\n";
+        return 0;
+    }
+    if (argc > 3 || (option == L"--check" && argc != 2)) {
+        std::cerr << "Usage: directx-capture [count] [existing-output-directory]\n";
+        return 2;
+    }
+    try {
+        const bool check_only = option == L"--check";
+        const unsigned count = argc >= 2 && !check_only ? parse_count(option) : 1;
+        const std::filesystem::path directory = argc == 3 ? argv[2] : L".";
+        if (!std::filesystem::is_directory(directory)) {
+            throw std::invalid_argument("The output directory must already exist.");
+        }
+        if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) &&
+            GetLastError() != ERROR_ACCESS_DENIED) {
+            throw std::runtime_error("Cannot enable per-monitor DPI awareness.");
+        }
+
+        ComPtr<IDirect3D9> d3d(Direct3DCreate9(D3D_SDK_VERSION));
+        if (d3d.get() == nullptr) throw std::runtime_error("Direct3DCreate9 failed.");
+        D3DDISPLAYMODE mode{};
+        check_hresult(d3d->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &mode), "Get display mode");
+        const HiddenWindow window;
+        D3DPRESENT_PARAMETERS parameters{};
+        parameters.Windowed = TRUE;
+        parameters.BackBufferCount = 1;
+        parameters.BackBufferWidth = 1;
+        parameters.BackBufferHeight = 1;
+        parameters.BackBufferFormat = D3DFMT_UNKNOWN;
+        parameters.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        parameters.hDeviceWindow = window.handle;
+
+        ComPtr<IDirect3DDevice9> device;
+        check_hresult(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window.handle,
+                                        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &parameters,
+                                        device.put()), "Create Direct3D device");
+        ComPtr<IDirect3DSurface9> surface;
+        check_hresult(device->CreateOffscreenPlainSurface(mode.Width, mode.Height,
+                       D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, surface.put(), nullptr), "Create capture surface");
+        if (check_only) {
+            std::cout << "Device and surface ready: " << mode.Width << " x " << mode.Height << ".\n";
+            return 0;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        for (unsigned index = 0; index < count; ++index) {
+            check_hresult(device->GetFrontBufferData(0, surface.get()), "Read front buffer");
+            const SurfaceLock locked(surface.get());
+            if (locked.rectangle.Pitch <= 0 ||
+                mode.Height > std::numeric_limits<std::size_t>::max() /
+                              static_cast<unsigned>(locked.rectangle.Pitch)) {
+                throw std::runtime_error("Invalid capture surface pitch.");
+            }
+            const std::size_t stride = static_cast<unsigned>(locked.rectangle.Pitch);
+            save_png(mode.Width, mode.Height, stride,
+                     static_cast<const std::uint8_t*>(locked.rectangle.pBits), stride * mode.Height,
+                     directory / ("cap" + std::to_string(index) + ".png"));
+        }
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        std::cout << "Saved " << count << " PNG file(s) in " << elapsed
+                  << " seconds, including encoding and file I/O.\n";
+        return 0;
+    } catch (const std::invalid_argument& error) {
+        std::cerr << error.what() << '\n';
+        return 2;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }
